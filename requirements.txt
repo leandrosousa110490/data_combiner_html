@@ -1,0 +1,10 @@
+Flask==3.0.2
+pandas==2.2.1
+numpy==1.26.4
+openpyxl==3.1.2
+python-magic==0.4.27
+tqdm==4.66.2
+werkzeug==3.0.1
+xlrd==2.0.1
+pyarrow==15.0.0
+fastparquet==2024.2.0 

@@ -12,66 +12,129 @@ import gc
 import numpy as np
 from tqdm import tqdm
 import shutil
+import psutil
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import pyarrow as pa
+import pyarrow.csv as csv
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24)  # For flash messages and session
+app.secret_key = os.urandom(24)
 app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024 * 1024  # 1GB max file size per file
+# Increase max content length to 10GB per file
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024 * 1024
 
-# Ensure upload folder exists
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+# Create uploads directory with subdirectories for better organization
+for subdir in ['input', 'output', 'temp']:
+    os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], subdir), exist_ok=True)
 
 ALLOWED_EXTENSIONS = {'csv', 'xlsx', 'xls', 'json', 'parquet', 'txt'}
+CHUNK_SIZE = 100000  # Adjust chunk size based on available memory
+MAX_WORKERS = max(1, psutil.cpu_count() - 1)  # Leave one CPU core free
 
 # Store file processing status
 processing_status = {}
 
-def cleanup_files(file_id, filepaths, output_path, cleanup_output=True):
-    """Clean up uploaded and processed files"""
+def allowed_file(filename):
+    """Check if the file extension is allowed"""
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def cleanup_files(file_id, input_files, output_file):
+    """Clean up input and output files"""
     try:
-        # Delete all uploaded files
-        for filepath in filepaths:
+        # Clean up input files
+        for filepath in input_files:
             if os.path.exists(filepath):
                 os.remove(filepath)
-                print(f"Deleted input file: {filepath}")
+                logger.info(f"Cleaned up input file: {filepath}")
         
-        # Delete the output file only if specified
-        if cleanup_output and os.path.exists(output_path):
-            os.remove(output_path)
-            print(f"Deleted output file: {output_path}")
+        # Clean up output file
+        if os.path.exists(output_file):
+            os.remove(output_file)
+            logger.info(f"Cleaned up output file: {output_file}")
         
-        # Remove the processing status if cleaning up everything
-        if cleanup_output and file_id in processing_status:
+        # Remove from processing status
+        if file_id in processing_status:
             del processing_status[file_id]
             
     except Exception as e:
-        print(f"Error during cleanup: {str(e)}")
+        logger.error(f"Error during cleanup: {str(e)}")
 
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+def get_memory_usage():
+    """Get current memory usage in percentage"""
+    return psutil.Process().memory_percent()
 
-def read_file_in_chunks(filepath, ext, separator=',', chunksize=10000):
-    """Read file in chunks to handle large files efficiently"""
+def adjust_chunk_size():
+    """Dynamically adjust chunk size based on available memory"""
+    memory_usage = get_memory_usage()
+    if memory_usage > 75:
+        return CHUNK_SIZE // 2
+    elif memory_usage < 25:
+        return CHUNK_SIZE * 2
+    return CHUNK_SIZE
+
+def read_file_in_chunks(filepath, ext, separator=',', chunksize=None):
+    """Read file in chunks with optimized settings for large files"""
+    if chunksize is None:
+        chunksize = adjust_chunk_size()
+    
     try:
         if ext == 'csv' or ext == 'txt':
             return pd.read_csv(filepath, sep=separator, chunksize=chunksize)
         elif ext in ['xlsx', 'xls']:
-            # Excel files need to be read completely, but we'll process them in chunks
+            # For Excel files, read all at once but split into chunks
             df = pd.read_excel(filepath)
             return np.array_split(df, max(1, len(df) // chunksize))
         elif ext == 'json':
-            # For JSON, we'll read in chunks using lines=True
             return pd.read_json(filepath, lines=True, chunksize=chunksize)
         elif ext == 'parquet':
-            # Parquet files are already optimized for chunked reading
-            return pd.read_parquet(filepath, engine='fastparquet')
+            # Read parquet file and split into chunks
+            df = pd.read_parquet(filepath)
+            return np.array_split(df, max(1, len(df) // chunksize))
         return None
     except Exception as e:
         raise Exception(f"Error reading file {filepath}: {str(e)}")
 
+def process_chunk(chunk, all_columns):
+    """Process a single chunk of data"""
+    try:
+        # Reindex the chunk to include all columns
+        chunk_reindexed = chunk.reindex(columns=all_columns)
+        
+        # Fill NaN values with appropriate defaults based on column type
+        for col in all_columns:
+            if col in chunk_reindexed:
+                if pd.api.types.is_numeric_dtype(chunk_reindexed[col]):
+                    chunk_reindexed[col].fillna(0, inplace=True)
+                else:
+                    chunk_reindexed[col].fillna('', inplace=True)
+        
+        return chunk_reindexed
+    except Exception as e:
+        logger.error(f"Error processing chunk: {str(e)}")
+        return None
+
+def read_sample_file(filepath, ext, separator):
+    """Read the first row of a file based on its extension"""
+    try:
+        if ext in ['csv', 'txt']:
+            return pd.read_csv(filepath, sep=separator, nrows=1)
+        elif ext in ['xlsx', 'xls']:
+            return pd.read_excel(filepath, nrows=1)
+        elif ext == 'json':
+            return pd.read_json(filepath, lines=True, nrows=1)
+        elif ext == 'parquet':
+            return pd.read_parquet(filepath).head(1)
+        return None
+    except Exception as e:
+        raise Exception(f"Error reading sample from {filepath}: {str(e)}")
+
 def process_files(file_id, filepaths, output_path, separator=','):
     try:
-        # Update status to processing
         processing_status[file_id]['status'] = 'processing'
         processing_status[file_id]['progress'] = 0
         total_files = len(filepaths)
@@ -86,69 +149,67 @@ def process_files(file_id, filepaths, output_path, separator=','):
         # First pass: collect all unique column names
         for i, filepath in enumerate(filepaths):
             processing_status[file_id]['current_operation'] = f'Analyzing file {i+1} of {total_files}'
-            processing_status[file_id]['progress'] = (i / total_files) * 30  # Use first 30% for analysis
+            processing_status[file_id]['progress'] = (i / total_files) * 30
             
-            ext = filepath.rsplit('.', 1)[1].lower()
             try:
-                # Read just the header of each file
-                if ext in ['csv', 'txt']:
-                    df_sample = pd.read_csv(filepath, sep=separator, nrows=1)
-                elif ext in ['xlsx', 'xls']:
-                    df_sample = pd.read_excel(filepath, nrows=1)
-                elif ext == 'json':
-                    df_sample = pd.read_json(filepath, lines=True, nrows=1)
-                elif ext == 'parquet':
-                    df_sample = pd.read_parquet(filepath, engine='fastparquet').head(1)
-                
-                all_columns.update(df_sample.columns)
+                ext = filepath.rsplit('.', 1)[1].lower()
+                df_sample = read_sample_file(filepath, ext, separator)
+                if df_sample is not None:
+                    all_columns.update(df_sample.columns)
             except Exception as e:
                 processing_status[file_id]['errors'].append(f"Warning: Could not read columns from {os.path.basename(filepath)}: {str(e)}")
         
         # Convert to list and sort for consistent column order
         all_columns = sorted(list(all_columns))
         
-        # Initialize the output file with headers
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(','.join(all_columns) + '\n')
-        
         # Process each file
         total_rows = 0
-        processed_files = []  # Keep track of successfully processed files
+        processed_files = []
+        
+        # Create output file and write header
+        with open(output_path, 'w', newline='', encoding='utf-8') as f:
+            f.write(separator.join(all_columns) + '\n')
         
         for i, filepath in enumerate(filepaths):
-            processing_status[file_id]['current_operation'] = f'Processing file {i+1} of {total_files}'
-            base_progress = 30 + (i / total_files) * 70  # Remaining 70% for processing
-            
-            ext = filepath.rsplit('.', 1)[1].lower()
             try:
+                processing_status[file_id]['current_operation'] = f'Processing file {i+1} of {total_files}'
+                base_progress = 30 + (i / total_files) * 70
+                
+                ext = filepath.rsplit('.', 1)[1].lower()
                 chunks = read_file_in_chunks(filepath, ext, separator)
                 chunk_count = 0
                 
-                for chunk in chunks:
-                    # Reindex the chunk to include all columns
-                    chunk_reindexed = chunk.reindex(columns=all_columns)
-                    
-                    # Append to CSV without headers (except for first chunk)
-                    chunk_reindexed.to_csv(output_path, mode='a', header=False, index=False)
-                    
-                    total_rows += len(chunk_reindexed)
-                    chunk_count += 1
-                    
-                    # Update progress
-                    chunk_progress = base_progress + (chunk_count / (chunk_count + 1)) * (70 / total_files)
-                    processing_status[file_id]['progress'] = min(99, chunk_progress)
-                    
-                    # Force garbage collection after each chunk
-                    del chunk_reindexed
-                    gc.collect()
+                # Process chunks
+                if isinstance(chunks, pd.io.parsers.TextFileReader):  # CSV/JSON chunks
+                    for chunk in chunks:
+                        processed_chunk = process_chunk(chunk, all_columns)
+                        if processed_chunk is not None:
+                            processed_chunk.to_csv(output_path, mode='a', header=False, index=False, sep=separator)
+                            total_rows += len(processed_chunk)
+                        chunk_count += 1
+                        
+                        # Update progress
+                        if chunk_count % 10 == 0:
+                            chunk_progress = base_progress + (chunk_count / (chunk_count + 1)) * (70 / total_files)
+                            processing_status[file_id]['progress'] = min(99, chunk_progress)
+                            gc.collect()
                 
-                # Add to processed files list
+                else:  # Excel/Parquet chunks (already in memory)
+                    for chunk in chunks:
+                        processed_chunk = process_chunk(chunk, all_columns)
+                        if processed_chunk is not None:
+                            processed_chunk.to_csv(output_path, mode='a', header=False, index=False, sep=separator)
+                            total_rows += len(processed_chunk)
+                        chunk_count += 1
+                        
+                        # Update progress
+                        chunk_progress = base_progress + (chunk_count / len(chunks)) * (70 / total_files)
+                        processing_status[file_id]['progress'] = min(99, chunk_progress)
+                
+                # Mark file as processed and delete it
                 processed_files.append(filepath)
-                
-                # Delete the input file immediately after successful processing
-                if os.path.exists(filepath):
-                    os.remove(filepath)
-                    print(f"Deleted processed file: {filepath}")
+                os.remove(filepath)
+                logger.info(f"Processed and deleted: {filepath}")
                 
             except Exception as e:
                 processing_status[file_id]['errors'].append(f"Error processing {os.path.basename(filepath)}: {str(e)}")
@@ -162,20 +223,21 @@ def process_files(file_id, filepaths, output_path, separator=','):
                 'total_rows': total_rows,
                 'columns': len(all_columns),
                 'column_names': all_columns,
-                'output_size': f"{os.path.getsize(output_path) / (1024 * 1024):.2f} MB"
+                'output_size': f"{os.path.getsize(output_path) / (1024 * 1024 * 1024):.2f} GB"
             }
         })
 
     except Exception as e:
+        logger.error(f"Error in process_files: {str(e)}")
         processing_status[file_id].update({
             'status': 'error',
             'error': str(e)
         })
-        # Clean up any remaining input files in case of error
+        # Clean up any remaining input files
         for filepath in filepaths:
             if filepath not in processed_files and os.path.exists(filepath):
                 os.remove(filepath)
-                print(f"Deleted input file after error: {filepath}")
+                logger.info(f"Deleted input file after error: {filepath}")
 
 @app.route('/')
 def index():

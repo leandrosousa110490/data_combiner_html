@@ -1,5 +1,6 @@
 from flask import Flask, render_template, request, jsonify, send_file, flash, redirect, url_for, session
 import pandas as pd
+import polars as pl
 import os
 from werkzeug.utils import secure_filename
 import json
@@ -17,10 +18,22 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pyarrow as pa
 import pyarrow.csv as csv
+import duckdb
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Initialize DuckDB with optimizations
+try:
+    # Create a DuckDB connection
+    db_conn = duckdb.connect()
+    db_conn.execute("SET enable_progress_bar=true")
+    db_conn.execute("SET memory_limit='16GB'")
+    db_conn.execute("SET temp_directory='uploads/temp'")
+except Exception as e:
+    logger.error(f"Error initializing DuckDB: {str(e)}")
+    db_conn = duckdb.connect()  # Fallback with default settings
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -33,11 +46,15 @@ for subdir in ['input', 'output', 'temp']:
     os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], subdir), exist_ok=True)
 
 ALLOWED_EXTENSIONS = {'csv', 'xlsx', 'xls', 'json', 'parquet', 'txt'}
-CHUNK_SIZE = 100000  # Adjust chunk size based on available memory
+CHUNK_SIZE = 500000  # Increased chunk size for better performance
 MAX_WORKERS = max(1, psutil.cpu_count() - 1)  # Leave one CPU core free
 
 # Store file processing status
 processing_status = {}
+
+def optimize_numeric_array(arr):
+    """Optimize numeric array operations"""
+    return np.nan_to_num(arr, 0)
 
 def allowed_file(filename):
     """Check if the file extension is allowed"""
@@ -77,6 +94,36 @@ def adjust_chunk_size():
         return CHUNK_SIZE * 2
     return CHUNK_SIZE
 
+def process_chunk(chunk, all_columns):
+    """Process a single chunk of data with optimized operations"""
+    try:
+        if isinstance(chunk, pl.LazyFrame):
+            # Handle Polars LazyFrame
+            df = chunk.collect().to_pandas()
+        else:
+            df = chunk
+
+        # Create DataFrame with all columns
+        df_reindexed = pd.DataFrame(index=df.index, columns=all_columns)
+        
+        # Process columns in batches for better performance
+        for col in all_columns:
+            if col in df.columns:
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    df_reindexed[col] = np.nan_to_num(df[col].values, 0)
+                else:
+                    df_reindexed[col] = df[col].fillna('')
+            else:
+                if pd.api.types.is_numeric_dtype(df_reindexed[col].dtype):
+                    df_reindexed[col] = 0
+                else:
+                    df_reindexed[col] = ''
+        
+        return df_reindexed
+    except Exception as e:
+        logger.error(f"Error processing chunk: {str(e)}")
+        return None
+
 def read_file_in_chunks(filepath, ext, separator=',', chunksize=None):
     """Read file in chunks with optimized settings for large files"""
     if chunksize is None:
@@ -84,51 +131,73 @@ def read_file_in_chunks(filepath, ext, separator=',', chunksize=None):
     
     try:
         if ext == 'csv' or ext == 'txt':
-            return pd.read_csv(filepath, sep=separator, chunksize=chunksize)
+            # Use Polars for faster CSV reading
+            return pl.scan_csv(filepath, separator=separator).with_streaming(True)
         elif ext in ['xlsx', 'xls']:
-            # For Excel files, read all at once but split into chunks
-            df = pd.read_excel(filepath)
-            return np.array_split(df, max(1, len(df) // chunksize))
+            # Use openpyxl for Excel files with memory optimization
+            try:
+                # First try reading with pandas directly
+                df = pd.read_excel(filepath, engine='openpyxl')
+                return [df]
+            except Exception as e:
+                logger.warning(f"Memory-efficient reading for {filepath}: {str(e)}")
+                # If that fails, try reading in chunks manually
+                import openpyxl
+                wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+                sheet = wb.active
+                
+                # Get headers
+                headers = [cell.value for cell in next(sheet.rows)]
+                
+                # Process rows in chunks
+                chunk_data = []
+                current_chunk = []
+                
+                for row in sheet.rows:
+                    if len(current_chunk) >= chunksize:
+                        chunk_df = pd.DataFrame(current_chunk, columns=headers)
+                        chunk_data.append(chunk_df)
+                        current_chunk = []
+                    
+                    row_data = [cell.value for cell in row]
+                    current_chunk.append(row_data)
+                
+                # Add the last chunk if any
+                if current_chunk:
+                    chunk_df = pd.DataFrame(current_chunk, columns=headers)
+                    chunk_data.append(chunk_df)
+                
+                wb.close()
+                return chunk_data
+                
         elif ext == 'json':
-            return pd.read_json(filepath, lines=True, chunksize=chunksize)
+            # Use Polars for JSON files
+            return pl.scan_ndjson(filepath).with_streaming(True)
         elif ext == 'parquet':
-            # Read parquet file and split into chunks
-            df = pd.read_parquet(filepath)
-            return np.array_split(df, max(1, len(df) // chunksize))
+            # Use DuckDB for Parquet files with memory optimizations
+            query = f"""
+            SELECT * FROM parquet_scan('{filepath}')
+            """
+            return db_conn.execute(query).df()
         return None
     except Exception as e:
         raise Exception(f"Error reading file {filepath}: {str(e)}")
 
-def process_chunk(chunk, all_columns):
-    """Process a single chunk of data"""
-    try:
-        # Reindex the chunk to include all columns
-        chunk_reindexed = chunk.reindex(columns=all_columns)
-        
-        # Fill NaN values with appropriate defaults based on column type
-        for col in all_columns:
-            if col in chunk_reindexed:
-                if pd.api.types.is_numeric_dtype(chunk_reindexed[col]):
-                    chunk_reindexed[col].fillna(0, inplace=True)
-                else:
-                    chunk_reindexed[col].fillna('', inplace=True)
-        
-        return chunk_reindexed
-    except Exception as e:
-        logger.error(f"Error processing chunk: {str(e)}")
-        return None
-
 def read_sample_file(filepath, ext, separator):
-    """Read the first row of a file based on its extension"""
+    """Read the first row of a file with optimized readers"""
     try:
         if ext in ['csv', 'txt']:
-            return pd.read_csv(filepath, sep=separator, nrows=1)
+            return pl.read_csv(filepath, separator=separator, n_rows=1).to_pandas()
         elif ext in ['xlsx', 'xls']:
+            # Use pandas to read first row of Excel files
             return pd.read_excel(filepath, nrows=1)
         elif ext == 'json':
-            return pd.read_json(filepath, lines=True, nrows=1)
+            return pl.read_ndjson(filepath, n_rows=1).to_pandas()
         elif ext == 'parquet':
-            return pd.read_parquet(filepath).head(1)
+            query = f"""
+            SELECT * FROM parquet_scan('{filepath}') LIMIT 1
+            """
+            return db_conn.execute(query).df()
         return None
     except Exception as e:
         raise Exception(f"Error reading sample from {filepath}: {str(e)}")
@@ -166,9 +235,9 @@ def process_files(file_id, filepaths, output_path, separator=','):
         total_rows = 0
         processed_files = []
         
-        # Create output file and write header
-        with open(output_path, 'w', newline='', encoding='utf-8') as f:
-            f.write(separator.join(all_columns) + '\n')
+        # Create output file with PyArrow for better performance
+        schema = pa.schema([pa.field(col, pa.string()) for col in all_columns])
+        writer = csv.CSVWriter(output_path, schema)
         
         for i, filepath in enumerate(filepaths):
             try:
@@ -177,14 +246,14 @@ def process_files(file_id, filepaths, output_path, separator=','):
                 
                 ext = filepath.rsplit('.', 1)[1].lower()
                 chunks = read_file_in_chunks(filepath, ext, separator)
-                chunk_count = 0
                 
-                # Process chunks
-                if isinstance(chunks, pd.io.parsers.TextFileReader):  # CSV/JSON chunks
-                    for chunk in chunks:
+                if isinstance(chunks, pl.LazyFrame):
+                    # Process Polars LazyFrame in chunks
+                    chunk_count = 0
+                    for chunk in chunks.collect(streaming=True):
                         processed_chunk = process_chunk(chunk, all_columns)
                         if processed_chunk is not None:
-                            processed_chunk.to_csv(output_path, mode='a', header=False, index=False, sep=separator)
+                            writer.write_table(pa.Table.from_pandas(processed_chunk))
                             total_rows += len(processed_chunk)
                         chunk_count += 1
                         
@@ -194,17 +263,22 @@ def process_files(file_id, filepaths, output_path, separator=','):
                             processing_status[file_id]['progress'] = min(99, chunk_progress)
                             gc.collect()
                 
-                else:  # Excel/Parquet chunks (already in memory)
-                    for chunk in chunks:
-                        processed_chunk = process_chunk(chunk, all_columns)
-                        if processed_chunk is not None:
-                            processed_chunk.to_csv(output_path, mode='a', header=False, index=False, sep=separator)
-                            total_rows += len(processed_chunk)
-                        chunk_count += 1
-                        
-                        # Update progress
-                        chunk_progress = base_progress + (chunk_count / len(chunks)) * (70 / total_files)
-                        processing_status[file_id]['progress'] = min(99, chunk_progress)
+                elif isinstance(chunks, pd.DataFrame):
+                    # Process DuckDB result
+                    processed_chunk = process_chunk(chunks, all_columns)
+                    if processed_chunk is not None:
+                        writer.write_table(pa.Table.from_pandas(processed_chunk))
+                        total_rows += len(processed_chunk)
+                
+                else:  # Handle regular chunks (e.g., from Excel files)
+                    # Use ThreadPoolExecutor for parallel processing
+                    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                        futures = [executor.submit(process_chunk, chunk, all_columns) for chunk in chunks]
+                        for future in as_completed(futures):
+                            processed_chunk = future.result()
+                            if processed_chunk is not None:
+                                writer.write_table(pa.Table.from_pandas(processed_chunk))
+                                total_rows += len(processed_chunk)
                 
                 # Mark file as processed and delete it
                 processed_files.append(filepath)
@@ -213,6 +287,9 @@ def process_files(file_id, filepaths, output_path, separator=','):
                 
             except Exception as e:
                 processing_status[file_id]['errors'].append(f"Error processing {os.path.basename(filepath)}: {str(e)}")
+        
+        # Close the writer
+        writer.close()
         
         # Update status with completion and statistics
         processing_status[file_id].update({
